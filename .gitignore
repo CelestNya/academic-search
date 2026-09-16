@@ -1,0 +1,6 @@
+node_modules/
+*.log
+.DS_Store
+# Local credentials must never be committed; they live in ~/.config/ars/.
+.env
+config.json
