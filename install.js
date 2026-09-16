@@ -102,6 +102,7 @@ function install() {
   }
 
   let installed = 0;
+  let firstDest = null;
   for (const t of targets) {
     const dest = path.join(t.dir, meta.name);
     if (LIST_ONLY) {
@@ -131,11 +132,11 @@ function install() {
     copyDir(SRC, dest);
     console.log(`  [${t.label}] installed -> ${dest}`);
     installed++;
+    if (!firstDest) firstDest = path.join(dest, entryFile() || "ars.cjs");
   }
   if (!LIST_ONLY) {
-    const f = entryFile() || "ars.cjs";
     console.log(`\n${installed} location(s) ready.`);
-    console.log(`Try: node ~/.zcode/skills/${meta.name}/${f} search "CRDT"`);
+    if (firstDest) console.log(`Try: node "${firstDest}" search "CRDT"`);
   }
 }
 

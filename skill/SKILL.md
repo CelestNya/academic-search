@@ -18,9 +18,9 @@ Use this skill for **academic literature**, not general web search:
 - Getting citation counts or open-access PDF links
 - Pulling an arXiv abstract
 
-For general web search, news, docs, or error messages, use the `anysearch`
-skill instead. Its academic vertical (`--domain academic`) is a fallback, but
-this CLI hits the scholarly APIs directly and is faster and more precise.
+For general web search, news, docs, or error messages, use a general web
+search tool instead. This CLI hits the scholarly APIs directly, which is
+faster and more precise for literature than a web search's academic vertical.
 
 ## Commands
 

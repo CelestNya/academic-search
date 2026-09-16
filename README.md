@@ -18,8 +18,8 @@ Agent search tools are usually MCP servers. That means a JSON-RPC connection, a
 per-client config file, and a re-install every time you switch agent software.
 This is the opposite: one script, plain HTTPS, one call in and one result out.
 
-It was written after the MCP-based academic stack on this machine broke. The
-reasons are worth knowing, because they are not obvious from the error messages:
+It was written after the MCP-based academic stack broke in exactly these ways.
+They are worth knowing, because none of them is obvious from the error message:
 
 - **OpenAlex now bills per request** and meters you by *exit IP*. Behind a
   shared proxy it answers `HTTP 403 Insufficient budget` even when you have
