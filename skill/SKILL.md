@@ -42,6 +42,17 @@ node $ARS paper 31375564
 # arXiv abstract page
 node $ARS fulltext 2212.02618
 
+# Citation network (who cited this / what this cites). S2-backed: 429s
+# intermittently without a key — retry.
+node $ARS network 2212.02618 --direction both
+node $ARS network 10.1145/2517349.2522737 --direction citations --max 30
+
+# Local full-text library: download once, then read/grep offline
+node $ARS download 2212.02618
+node $ARS read 2212.02618 --offset 20000        # paged read (20KB pages)
+node $ARS read 2212.02618 --grep "metadata overhead"   # matching passages
+node $ARS library                                # what is saved locally
+
 # Check which upstream APIs are currently reachable
 node $ARS sources
 
@@ -51,7 +62,14 @@ node $ARS search "CRDT" --source arxiv --json
 
 Options: `-s/--source` (arxiv|crossref|pubmed|s2|all), `-m/--max`,
 `-y/--year`, `-a/--author`, `--sort relevance|date`, `-j/--json`,
-plus the credential flags below.
+`--direction citations|references|both` (network), `-g/--grep` and
+`--offset` (read), `--refresh` (download), plus the credential flags below.
+
+**Read long papers with `--grep`, not by dumping.** A full paper is
+90KB+; `read` without `--grep` shows one 20KB page at a time. `--grep`
+shows matching passages with context, which is the way an agent should
+work through a paper. Use `--grep` as a flag — a leading-slash pattern
+gets corrupted by Git Bash path conversion before this CLI runs.
 
 ## Credentials (all optional)
 

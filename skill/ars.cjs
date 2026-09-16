@@ -425,6 +425,47 @@ async function s2ByDoi(doi) {
   };
 }
 
+// Citation network. S2 is the only public API with forward citations, so this
+// feature depends on it and inherits its intermittent 429 — retry, or supply
+// an s2 key. resolveId() lets callers pass DOI / arXiv / S2 / PMID uniformly.
+async function s2ResolveId(id) {
+  const s = String(id).trim();
+  if (/^10\.\d{4,9}\//.test(s)) return `DOI:${s}`;
+  if (/^doi:/i.test(s)) return `DOI:${s.replace(/^doi:/i, "")}`;
+  if (/^pmid:/i.test(s)) return `PMID:${s.replace(/^pmid:/i, "")}`;
+  if (/^\d{7,8}$/.test(s)) return `PMID:${s}`;
+  if (/^arxiv:/i.test(s)) return `ARXIV:${s.replace(/^arxiv:/i, "")}`;
+  if (/^\d{4}\.\d{4,5}(v\d+)?$/.test(s)) return `ARXIV:${s}`;
+  return s; // already an S2 paperId
+}
+
+async function s2Network(id, { direction = "both", max = 20 } = {}) {
+  const pid = await s2ResolveId(id);
+  const fields = "title,year,authors,externalIds,citationCount,abstract";
+  const dirs = direction === "both" ? ["citations", "references"] : [direction];
+  const out = {};
+  for (const d of dirs) {
+    const params = { fields: d === "citations" ? fields : fields, limit: String(max) };
+    const j = await getJson(
+      `${S2}/paper/${encodeURIComponent(pid)}/${d}?` + new URLSearchParams(params),
+      undefined,
+      s2Headers()
+    );
+    // /citations wraps rows in citingPaper; /references in citedPaper.
+    const rows = (j.data || []).map((r) => r.citingPaper || r.citedPaper || r.citingPaperInfo || r.citedPaperInfo || r).filter(Boolean);
+    out[d === "citations" ? "citedBy" : "references"] = rows.map((p) => ({
+      title: p.title,
+      authors: authorsOf((p.authors || []).map((a) => a.name)),
+      year: p.year,
+      doi: p.externalIds?.DOI || null,
+      arxiv: p.externalIds?.ArXiv || null,
+      citations: p.citationCount ?? null,
+      id: p.paperId,
+    }));
+  }
+  return { id: pid, ...out };
+}
+
 // ------------------------------------------------------------------ output
 
 function renderPaper(p, i) {
@@ -474,6 +515,11 @@ function parseArgs(argv) {
     else if (a === "--year" || a === "-y") opts.year = argv[++i];
     else if (a === "--author" || a === "-a") opts.author = argv[++i];
     else if (a === "--sort") opts.sort = argv[++i];
+    else if (a === "--direction") opts.direction = argv[++i];
+    else if (a === "--grep" || a === "-g") opts.grep = argv[++i];
+    else if (a === "--case") opts.ignoreCase = false;
+    else if (a === "--refresh") opts.refresh = true;
+    else if (a === "--offset") opts.offset = Number(argv[++i]) || 0;
     else if (a === "--s2-key") CLI_CREDS.s2 = argv[++i];
     else if (a === "--pubmed-key") CLI_CREDS.pubmed = argv[++i];
     else if (a === "--mailto") CLI_CREDS.mailto = argv[++i];
@@ -522,16 +568,32 @@ USAGE
   ars search "<query>" [options]
   ars paper  <DOI|arXiv-id|PMID> [--json]
   ars fulltext <arXiv-id>
+  ars network  <DOI|arXiv-id|PMID> [--direction citations|references|both]
+  ars download <arXiv-id> [--refresh]
+  ars read     <arXiv-id> [--grep "<pattern>"] [--offset <n>] [--case]
+  ars library
   ars sources
   ars keys
 
 OPTIONS
   -s, --source <name>   arxiv|crossref|pubmed|s2|all   (default: all)
-  -m, --max <n>         results per source             (default: 5)
+  -m, --max <n>         results per source / network rows (default: 5 / 20)
   -y, --year <year>     year filter (search only)
   -a, --author <name>   author filter (crossref)
       --sort <mode>     relevance|date                 (arxiv only)
+      --refresh         re-download even if already in the library
+      --offset <n>      read from byte offset (papers are shown in 20KB pages)
+  -g, --grep "<re>"     read: grep the local copy instead of dumping it
+      --case            grep: disable case-insensitive matching
   -j, --json            emit JSON instead of Markdown
+
+LOCAL LIBRARY
+  \`download\` saves a paper's full text to ~/.config/ars/library/<id>.txt
+  (arXiv HTML when the paper has it, the abstract page otherwise).
+  \`read <id> --grep "pattern"\` shows matching passages with context —
+  the way to work through a long paper. \`library\` lists what is saved.
+  Git Bash note: use --grep, not a leading-slash pattern; MSYS path
+  conversion rewrites "/pattern/" into a Windows path before this CLI runs.
 
 CREDENTIALS (all optional; every source works anonymously)
       --s2-key <k>      Semantic Scholar key (removes 429)
@@ -546,8 +608,9 @@ CREDENTIALS (all optional; every source works anonymously)
 NOTES
   arXiv covers CS/physics/math preprints; crossref covers published
   journals (broad); pubmed covers biomedical with MeSH; s2 adds citation
-  counts and open-access PDF links. s2 rate-limits anonymous callers and
-  returns 429 intermittently — supply a key if you rely on it.
+  counts, open-access PDF links and the citation network (\`network\`).
+  s2 rate-limits anonymous callers and returns 429 / ECONNRESET
+  intermittently — retry, or supply a key if you rely on it.
   This CLI deliberately bypasses http_proxy: Node's core https module
   ignores it, and OpenAlex rejects a shared proxy IP. Leave it that way.
 `;
@@ -682,6 +745,165 @@ async function cmdFulltext(opts) {
   console.log(abstract ? abstract.replace(/^Abstract:\s*/i, "") : "(abstract not found on page)");
 }
 
+// ---------------------------------------------------------- local fulltext
+//
+// Downloads a paper's full text (arXiv HTML endpoint when available, LaTeX
+// e-print otherwise) into a local library, then `read` shows it — or greps it.
+// This replaces the local-fulltext half of the MCP servers this CLI stands in
+// for, without any daemon or JSON-RPC.
+
+function libraryDir() {
+  const d = CONFIG.data.library || path.join(os.homedir(), ".config", "ars", "library");
+  fs.mkdirSync(d, { recursive: true });
+  return d;
+}
+
+// arXiv serves prebuilt HTML for most post-2023 papers and falls back to a
+// LaTeX-to-HTML conversion; very old papers only have the e-print tarball.
+function htmlToText(html) {
+  let s = html;
+  s = s.replace(/<script[\s\S]*?<\/script>/gi, " ");
+  s = s.replace(/<style[\s\S]*?<\/style>/gi, " ");
+  // Keep math alttext, which carries the LaTeX the rendering drops.
+  s = s.replace(/<math[^>]*alttext="([^"]*)"[^>]*>[\s\S]*?<\/math>/gi, " $1 ");
+  s = s.replace(/<(h[1-6])[^>]*>/gi, "\n\n");
+  s = s.replace(/<\/(h[1-6])>/gi, "\n");
+  s = s.replace(/<(p|div|section|li|tr)[^>]*>/gi, "\n");
+  s = s.replace(/<[^>]+>/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    // Collapse runs of blanks but keep line structure: the generic \s+→" "
+    // in stripTags would flatten the whole paper onto one line, which makes
+    // grep-mode hits unreadable.
+    .replace(/[^\S\n]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return s;
+}
+
+async function cmdNetwork(opts) {
+  const id = opts._[0];
+  if (!id) {
+    console.error("error: missing paper id (DOI / arXiv / PMID / S2)");
+    process.exit(2);
+  }
+  const net = await s2Network(id, { direction: opts.direction, max: opts.max || 20 });
+  if (opts.json) {
+    console.log(JSON.stringify(net, null, 2));
+    return;
+  }
+  console.log(`# citation network for ${net.id}\n`);
+  const render = (title, list) => {
+    console.log(`## ${title} (${list.length})`);
+    if (!list.length) {
+      console.log("  (none)");
+      return;
+    }
+    list.forEach((p, i) => {
+      const ids = [p.doi && `DOI:${p.doi}`, p.arxiv && `arXiv:${p.arxiv}`].filter(Boolean).join(" ");
+      console.log(`${i + 1}. ${p.title}${p.year ? ` (${p.year})` : ""}${p.citations != null ? ` · cited ${p.citations}` : ""}`);
+      if (ids) console.log(`   ${ids}`);
+    });
+  };
+  if (net.citedBy) render("cited by", net.citedBy);
+  if (net.references) render("\nreferences", net.references);
+}
+
+async function cmdDownload(opts) {
+  const id = (opts._[0] || "").replace(/^arxiv:/i, "");
+  if (!id) {
+    console.error("error: missing arXiv id");
+    process.exit(2);
+  }
+  const dir = libraryDir();
+  const dest = path.join(dir, id + ".txt");
+  const metaPath = path.join(dir, id + ".json");
+
+  // Idempotent: re-downloading the same paper wastes quota and time.
+  if (fs.existsSync(dest) && !opts.refresh) {
+    console.log(`already saved: ${dest}`);
+    return;
+  }
+
+  let text = null;
+  let source = null;
+  try {
+    const html = await request(`https://arxiv.org/html/${id}`, { accept: "text/html" });
+    text = htmlToText(html);
+    source = "arxiv-html";
+  } catch {
+    // No HTML version — try extracting plain text from the abstract page so
+    // `read` still has something, and note that full text is unavailable.
+    const abs = await request(`https://arxiv.org/abs/${id}`, { accept: "text/html" });
+    text = htmlToText(abs);
+    source = "arxiv-abs-only";
+  }
+
+  fs.writeFileSync(dest, text, "utf8");
+  const meta = { id, source, saved: new Date().toISOString(), chars: text.length };
+  fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), "utf8");
+  console.log(`saved ${id} (${source}, ${text.length} chars) -> ${dest}`);
+}
+
+async function cmdRead(opts) {
+  const id = (opts._[0] || "").replace(/^arxiv:/i, "");
+  const dir = libraryDir();
+  const dest = path.join(dir, id + ".txt");
+  if (!fs.existsSync(dest)) {
+    console.error(`not in library: ${id} — run \`ars download ${id}\` first`);
+    process.exit(1);
+  }
+  const text = fs.readFileSync(dest, "utf8");
+  const meta = JSON.parse(fs.readFileSync(path.join(dir, id + ".json"), "utf8"));
+
+  // grep mode is a flag, not a /pattern/ positional: Git Bash rewrites a
+  // leading-slash argument into a Windows path (MSYS path conversion), which
+  // silently corrupts "/pattern/" before this code ever sees it.
+  const pattern = opts.grep || "";
+  if (pattern) {
+    const re = new RegExp(pattern, opts.ignoreCase === false ? "" : "i");
+    const lines = text.split("\n");
+    const hits = [];
+    lines.forEach((l, i) => {
+      const idx = l.search(re);
+      if (idx >= 0) {
+        // Even with line structure, one paragraph can run long; show a window
+        // around the match rather than the whole line.
+        const from = Math.max(0, idx - 150);
+        const snippet = (from > 0 ? "…" : "") + l.slice(from, idx + 300) + "…";
+        hits.push(`${i + 1}: ${snippet}`);
+      }
+    });
+    console.log(`# ${id} (grep "${pattern}" — ${hits.length} hits)`);
+    console.log(hits.slice(0, 40).join("\n\n") || "(no matches)");
+    return;
+  }
+  console.log(`# ${id} (${meta.source}, ${meta.chars} chars)`);
+  const start = opts.offset || 0;
+  console.log(text.slice(start, start + 20000));
+  if (meta.chars > start + 20000) console.log(`\n[truncated — use offset to continue]`);
+}
+
+async function cmdLibrary() {
+  const dir = libraryDir();
+  const files = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
+  if (!files.length) {
+    console.log("(library empty)");
+    return;
+  }
+  console.log(`# library (${dir})\n`);
+  for (const f of files) {
+    try {
+      const m = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"));
+      console.log(`  ${m.id}  ${m.source}  ${m.chars} chars  ${m.saved.slice(0, 10)}`);
+    } catch {}
+  }
+}
+
 async function cmdSources() {
   const checks = [
     ["arxiv", "https://export.arxiv.org/api/query?search_query=all:test&max_results=1"],
@@ -725,6 +947,14 @@ async function main() {
       return cmdPaper(opts);
     case "fulltext":
       return cmdFulltext(opts);
+    case "network":
+      return cmdNetwork(opts);
+    case "download":
+      return cmdDownload(opts);
+    case "read":
+      return cmdRead(opts);
+    case "library":
+      return cmdLibrary();
     case "sources":
       return cmdSources();
     case "keys":
